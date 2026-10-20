@@ -1,8 +1,11 @@
 'use strict';
 const D = window.CASCADE_DATA;
 if (!D || D.schema_version !== 5) throw new Error('Export the current CASCADE operator dataset first.');
+const RUN = window.CASCADE_RUN, INDEX = window.CASCADE_INDEX;
+const HW = D.config.hardware, CHIPS = HW.rows*HW.columns, TP = D.stages[0].chips.length;
 const colors = ['#127464', '#3f6ca8', '#9c6627', '#795b9d'];
-const state = {step:0, stage:0, layer:0, chip:4, key:'Q.raw', expert:null, message:0, phase:0, route:null, graphExpanded:false, placementExpanded:false, simCategory:'local', simPart:'all', simService:null};
+const initialStep = Math.max(0, Math.min(3, +new URLSearchParams(location.search).get('step') || 0));
+const state = {step:initialStep, stage:0, layer:0, chip:D.topology.host_chiplets[0], key:'Q.raw', expert:null, message:0, phase:0, route:null, graphExpanded:false, placementExpanded:false, simCategory:'local', simPart:'all', simService:null};
 const $ = id => document.getElementById(id);
 const esc = x => String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num = x => new Intl.NumberFormat('en-US').format(x);
@@ -12,8 +15,8 @@ const shape = tensor => '['+tensor.shape.join(' × ')+']';
 const stage = () => D.stages[state.stage];
 const block = () => stage().blocks.find(b=>b.index===state.layer);
 const stageOf = chip => D.stages.find(s=>s.chips.includes(chip)).index;
-const pos = chip => [160+(chip%4)*113,63+Math.floor(chip/4)*116];
-const labels = ['Architecture','Operators','Simulation'];
+const pos = chip => [160+(chip%HW.columns)*113,63+Math.floor(chip/HW.columns)*116];
+const labels = ['Architecture','Operators','Simulation','Results'];
 
 function operators(){
   const ids=[...(state.layer===stage().layers[0]?stage().incoming:[]), ...block().operator_ids,
@@ -92,29 +95,34 @@ function renderTopology(){
   const paths=selectedPaths(),p=state.step===2?simulationService():phase();
   let svg=`<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="${colors[state.stage]}"/></marker></defs>`;
   D.stages.forEach(s=>{
-    const points=s.chips.map(pos),x=Math.min(...points.map(v=>v[0]))-49,y=Math.min(...points.map(v=>v[1]))-53;
-    svg+=`<rect x="${x}" y="${y}" width="211" height="215" rx="12" fill="${colors[s.index]}" fill-opacity="${s.index===state.stage?'.075':'.025'}" stroke="${colors[s.index]}" stroke-opacity="${s.index===state.stage?'.5':'.13'}" stroke-dasharray="5 4"/>`;
+    const points=s.chips.map(pos),xs=points.map(v=>v[0]),ys=points.map(v=>v[1]);
+    const x=Math.min(...xs)-49,y=Math.min(...ys)-53,width=Math.max(...xs)-Math.min(...xs)+98,height=Math.max(...ys)-Math.min(...ys)+99;
+    svg+=`<rect x="${x}" y="${y}" width="${width}" height="${height}" rx="12" fill="${colors[s.index]}" fill-opacity="${s.index===state.stage?'.075':'.025'}" stroke="${colors[s.index]}" stroke-opacity="${s.index===state.stage?'.5':'.13'}" stroke-dasharray="5 4"/>`;
   });
   D.topology.physical_d2d_links.filter(([a,b])=>a<b).forEach(([a,b])=>{
     const [x1,y1]=pos(a),[x2,y2]=pos(b);
     svg+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#b9cac0" stroke-width="3"/>`;
   });
-  svg+=`<rect x="11" y="172" width="64" height="126" rx="8" fill="#e8efea" stroke="#bdcdc1"/><text x="43" y="222" text-anchor="middle" style="font-size:12px;font-weight:600">HOST</text><text x="43" y="241" text-anchor="middle" style="font-size:8px">PCIe 6 ×16</text><text x="43" y="257" text-anchor="middle" style="font-size:8px">128 GB/s/dir</text>`;
-  D.topology.host_chiplets.forEach(c=>{
+  // The host box spans both host-connected chiplets; each gets its own PCIe line.
+  const hostYs=D.topology.host_chiplets.map(c=>pos(c)[1]),top=Math.min(...hostYs)-7,bottom=Math.max(...hostYs)+3,middle=(top+bottom)/2;
+  svg+=`<rect x="11" y="${top}" width="64" height="${bottom-top}" rx="8" fill="#e8efea" stroke="#bdcdc1"/><text x="43" y="${middle-13}" text-anchor="middle" style="font-size:12px;font-weight:600">HOST</text><text x="43" y="${middle+6}" text-anchor="middle" style="font-size:8px">PCIe 6 ×16</text><text x="43" y="${middle+22}" text-anchor="middle" style="font-size:8px">128 GB/s/dir</text>`;
+  D.topology.host_chiplets.forEach((c,i)=>{
     const [x,y]=pos(c),m=state.step===2?simulationMessage():message(),active=(isOperatorView()||state.step===2)&&m?.kind.startsWith('host_')&&m.chiplet_id===c;
-    svg+=`<path d="M75 ${c===4?199:271} L98 ${y} L${x-38} ${y}" fill="none" stroke="${active?colors[state.stage]:'#b3c4b9'}" stroke-width="${active?5:2}"/>`;
+    svg+=`<path d="M75 ${i===0?top+27:bottom-27} L98 ${y} L${x-38} ${y}" fill="none" stroke="${active?colors[state.stage]:'#b3c4b9'}" stroke-width="${active?5:2}"/>`;
   });
   paths.forEach(path=>path.slice(1).forEach((to,i)=>{
     const from=path[i],a=pos(from),b=pos(to),dx=b[0]-a[0],dy=b[1]-a[1],len=Math.hypot(dx,dy),r=43;
     const active=state.route||p?.name===`link_${from}_${to}`;
     svg+=`<line class="transfer-hop" data-hop="${from}-${to}" x1="${a[0]+dx*r/len}" y1="${a[1]+dy*r/len}" x2="${b[0]-dx*r/len}" y2="${b[1]-dy*r/len}" stroke="${colors[state.stage]}" stroke-width="${active?5:3}" stroke-opacity="${active?1:.28}" marker-end="url(#arrow)"/>`;
   }));
-  for(let chip=0;chip<16;chip++){
+  for(let chip=0;chip<CHIPS;chip++){
     const [x,y]=pos(chip),s=stageOf(chip),rank=D.stages[s].chips.indexOf(chip),chosen=chip===state.chip,a=chipActivity(chip);
     const rankLabel=`TP rank ${rank}`;
     svg+=`<g role="button" tabindex="0" data-chip="${chip}" aria-label="Chiplet ${chip}, pipeline stage ${s+1}, tensor rank ${rank}${a.label?', '+esc(a.label):''}"><title>C${chip}: ${esc(a.slice||a.label||`Stage ${s+1}, TP rank ${rank}`)}</title><rect x="${x-38}" y="${y-34}" width="76" height="75" rx="7" fill="${a.active?'#e3f0e7':'#fff'}" stroke="${colors[s]}" stroke-opacity="${chosen||a.active?1:.38}" stroke-width="${chosen?3:a.active?2:1}"/><text class="chip-id" x="${x}" y="${y-9}" text-anchor="middle">C${chip}${D.topology.host_chiplets.includes(chip)?' ★':''}</text><text class="chip-small" x="${x}" y="${y+8}" text-anchor="middle">${esc(rankLabel)}</text>${a.label?`<text class="chip-activity" x="${x}" y="${y+24}" text-anchor="middle">${esc(a.label)}</text>`:''}</g>`;
   }
-  svg+='<text x="322" y="503" text-anchor="middle" class="chip-small">D2D · 256 GB/s per port, per direction</text>';
+  const width=160+(HW.columns-1)*113+131,height=63+(HW.rows-1)*116+119;
+  svg+=`<text x="${(160+pos(CHIPS-1)[0])/2-8}" y="${height-27}" text-anchor="middle" class="chip-small">D2D · 256 GB/s per port, per direction</text>`;
+  $('topology').setAttribute('viewBox',`0 0 ${width} ${height}`);
   $('topology').innerHTML=svg;
   $('topology').querySelectorAll('[data-chip]').forEach(el=>{
     const activate=()=>{
@@ -240,7 +248,7 @@ function operatorFormulaMarkup(op,service=null){
 function operatorControls(){
   const all=operators(),op=operator(),index=all.indexOf(op),desc=description();
   const experts=[...new Set(op.instances.map(i=>i.expert_id).filter(e=>e!==null))].sort((a,b)=>a-b);
-  return `<div class="operator-picker"><label for="operator-choice">Layer operation</label><select id="operator-choice">${all.map((o,i)=>`<option value="${o.id}" ${o.id===op.id?'selected':''}>${String(i+1).padStart(2,'0')} · ${esc(description(o).label)}${communicationLabel(o)?' · ↔ '+communicationLabel(o):''}</option>`).join('')}</select><div class="operator-navigation"><button id="previous-operator" ${index===0?'disabled':''}>← Previous operation</button><span>${index+1} / ${all.length}</span><button id="next-operator" ${index===all.length-1?'disabled':''}>Next operation →</button></div><button id="next-communication" class="communication-jump">↔ Next communication operation</button></div>${experts.length&&op.key!=='expert.accum'?`<div class="expert-choice"><label for="expert-choice">Active expert</label><select id="expert-choice"><option value="all">All ${experts.length} active experts</option>${experts.map(e=>`<option value="${e}" ${state.expert===e?'selected':''}>Expert ${e}</option>`).join('')}</select><span>Every selected expert uses all four TP ranks.</span></div>`:''}<div class="operator-summary"><h3>${esc(desc.label)}</h3>${operatorFormulaMarkup(op)}</div>`;
+  return `<div class="operator-picker"><label for="operator-choice">Layer operation</label><select id="operator-choice">${all.map((o,i)=>`<option value="${o.id}" ${o.id===op.id?'selected':''}>${String(i+1).padStart(2,'0')} · ${esc(description(o).label)}${communicationLabel(o)?' · ↔ '+communicationLabel(o):''}</option>`).join('')}</select><div class="operator-navigation"><button id="previous-operator" ${index===0?'disabled':''}>← Previous operation</button><span>${index+1} / ${all.length}</span><button id="next-operator" ${index===all.length-1?'disabled':''}>Next operation →</button></div><button id="next-communication" class="communication-jump">↔ Next communication operation</button></div>${experts.length&&op.key!=='expert.accum'?`<div class="expert-choice"><label for="expert-choice">Active expert</label><select id="expert-choice"><option value="all">All ${experts.length} active experts</option>${experts.map(e=>`<option value="${e}" ${state.expert===e?'selected':''}>Expert ${e}</option>`).join('')}</select><span>Every selected expert uses all ${TP} TP ranks.</span></div>`:''}<div class="operator-summary"><h3>${esc(desc.label)}</h3>${operatorFormulaMarkup(op)}</div>`;
 }
 function wireOperatorControls(){
   $('operator-choice').onchange=e=>selectOperator(e.target.value);
@@ -305,13 +313,15 @@ function wireCommunication(){
 function renderLesson(){
   let html;
   if(state.step===0){
-    html='<p class="eyebrow">01 / ARCHITECTURE</p><h2>Chiplet architecture</h2><p>The physical D2D network connects 16 cHBM chiplets. Four TP chiplets cooperate within each of four PP stages.</p>';
-    html+=`<div class="fact-row"><div class="fact"><strong>16</strong>cHBM chiplets</div><div class="fact"><strong>576 GB</strong>total HBM capacity</div><div class="fact"><strong>44 TB/s</strong>aggregate HBM bandwidth</div></div><h3>Local chiplet resources</h3><div class="chip-inside"><div class="hbm-block"><b>HBM4</b>36 GB · 2.75 TB/s</div><div class="pes">${[0,1,2,3].map(i=>`<div>PE ${i}<small>DMA · Tensor · SIMD</small></div>`).join('')}</div></div><p>Four PEs share local memory and NoC: each has one HBM / NoC port with a quarter of the chiplet bandwidth, so their transfers run concurrently. Each PE overlaps a tile group's DMA, Tensor and SIMD work; as in FuseMax, the Tensor array also runs softmax's max, exp and sum. The three D2D ports transmit concurrently and do not consume local HBM / NoC bandwidth. Tensor throughput is 22 TFLOPS per chiplet, split across its PEs in the coarse descriptor model.</p><p class="note">C4 and C8 connect to the host. The physical ports stay fixed as logical TP/PP groups are explored.</p>`;
+    const hosts=D.topology.host_chiplets.map(c=>'C'+c).join(' and ');
+    const layout=HW.rows===6?'<p class="note">This 6×6 array extends CAL, which specifies only the 4×4 device. Each 3×3 quadrant is one PP stage and TP9 group; its D2D links form a ladder (perimeter ring plus middle row), so every chiplet keeps at most three ports. Adjacent quadrants share two links, and PP relays use the outer ones. With eight KV heads over nine ranks, one rank per stage skips attention and only relays TP sums.</p>':'';
+    html=`<p class="eyebrow">01 / ARCHITECTURE</p><h2>Chiplet architecture</h2><p>The physical D2D network connects ${CHIPS} cHBM chiplets. ${TP} TP chiplets cooperate within each of ${D.stages.length} PP stages.</p>`;
+    html+=`<div class="fact-row"><div class="fact"><strong>${CHIPS}</strong>cHBM chiplets</div><div class="fact"><strong>${num(CHIPS*HW.hbm_capacity_bytes/1e9)} GB</strong>total HBM capacity</div><div class="fact"><strong>${num(+(CHIPS*HW.hbm_bandwidth_Bps/1e12).toFixed(2))} TB/s</strong>aggregate HBM bandwidth</div></div><h3>Local chiplet resources</h3><div class="chip-inside"><div class="hbm-block"><b>HBM4</b>36 GB · 2.75 TB/s</div><div class="pes">${[0,1,2,3].map(i=>`<div>PE ${i}<small>DMA · Tensor · SIMD</small></div>`).join('')}</div></div><p>Four PEs share local memory and NoC: each has one HBM / NoC port with a quarter of the chiplet bandwidth, so their transfers run concurrently. Each PE overlaps a tile group's DMA, Tensor and SIMD work; as in FuseMax, the Tensor array also runs softmax's max, exp and sum. The three D2D ports transmit concurrently and do not consume local HBM / NoC bandwidth. Tensor throughput is 22 TFLOPS per chiplet, split across its PEs in the coarse descriptor model.</p>${layout}<p class="note">${hosts} connect to the host. The physical ports stay fixed as logical TP/PP groups are explored.</p>`;
     $('lesson').innerHTML=html;return;
   }
   if(!isOperatorView())return;
   $('lesson').innerHTML=`<p class="eyebrow">02 / OPERATORS</p><h2>Operator mapping and execution</h2><p>Select a layer and operation. Follow its tensor shapes, TP placement and local execution or physical communication phases.</p>`+
-    operatorControls()+(operator().messages.length?'':`<details id="operator-placement" class="operator-placement" ${state.placementExpanded?'open':''}><summary>TP placement across four chiplets</summary>${renderMapping()}</details>`)+
+    operatorControls()+(operator().messages.length?'':`<details id="operator-placement" class="operator-placement" ${state.placementExpanded?'open':''}><summary>TP placement across ${TP} chiplets</summary>${renderMapping()}</details>`)+
     `<section class="operator-execution"><h3>Execution and data movement</h3>${renderCommunication()}</section>`;
   wireOperatorControls();wireCommunication();
   if($('operator-placement'))$('operator-placement').ontoggle=e=>{state.placementExpanded=e.target.open;};
@@ -326,9 +336,12 @@ function render(){
   document.querySelectorAll('[data-stage]').forEach(el=>el.onclick=()=>selectStage(+el.dataset.stage));
   $('layer-controls').innerHTML=`<label for="layer-choice">Inspect layer</label><select id="layer-choice">${stage().blocks.map(b=>`<option value="${b.index}" ${b.index===state.layer?'selected':''}>Layer ${b.index+1} · ${b.attention_tokens===D.config.context_tokens+1?'Full':'Window 128'} attention</option>`).join('')}</select>`;
   $('layer-choice').onchange=e=>{state.layer=+e.target.value;state.expert=null;resetExecution();render();};
-  document.querySelector('.workspace').hidden=state.step===2;
+  document.querySelector('.workspace').hidden=state.step>=2;
   $('simulation-workspace').hidden=state.step!==2;
-  renderLesson();renderSimulation();renderTopology();renderLayerGraph();
+  $('results-workspace').hidden=state.step!==3;
+  document.querySelector('.run-selection').hidden=state.step===3;
+  renderArraySwitch();
+  renderLesson();renderSimulation();renderTopology();renderLayerGraph();renderResults();
   $('step-label').textContent=`0${state.step+1} / 0${labels.length}`;
   $('next-step').textContent=state.step===labels.length-1?'Back to architecture ↺':'Next: '+labels[state.step+1]+' →';
   if(focusId&&$(focusId))$(focusId).focus({preventScroll:true});
@@ -341,10 +354,27 @@ function route(source,destination){
   }
   return null;
 }
-$('latency').textContent=time(D.summary.latency_s);
+function renderArraySwitch(){
+  // Switching arrays reloads the page with the other saved run, keeping the current step.
+  $('array-switch').innerHTML=(INDEX?.runs||[]).map(r=>`<a href="?array=${r.id}&step=${state.step}" ${r.id===RUN?.id?'aria-current="page"':''}>${r.id.replace('x','×')} · TP${r.tensor_parallel} / PP${r.pipeline_stages}</a>`).join('');
+}
+function fillRunText(){
+  const mapping=`TP${TP} / PP${D.stages.length}`,array=`${HW.rows}×${HW.columns}`,cal=HW.rows===4;
+  $('intro-eyebrow').textContent=`GPT-OSS-120B · ${array} · ${mapping}`;
+  $('run-mapping').textContent=`${array} · TP ${TP} × PP ${D.stages.length} · ${D.config.model.num_hidden_layers} layers`;
+  $('latency').textContent=time(D.summary.latency_s);
+  $('period').textContent=D.summary.steady_state_period_s?time(D.summary.steady_state_period_s):'Not measured';
+  $('map-eyebrow').textContent=cal?'PHYSICAL DEVICE · CAL FIGURE 2':`PHYSICAL DEVICE · ${array} EXTENSION`;
+  $('link-count').textContent=`${D.topology.physical_d2d_links.length/2} physical links`;
+  $('mapping-source').textContent=cal?'CAL Figure 2 defines this physical array; Figure 3 defines TP4 / PP4.':
+    `This ${array} array extends CAL Figures 2 and 3: four quadrant stages run ${mapping} over ladder D2D links, which CAL does not specify.`;
+  $('footer-mapping').textContent=`Single device · ${array} · ${mapping} · coarse system model`;
+  $('trace-download').href=RUN?.trace||'run.json.gz';
+}
+fillRunText();
 $('artifact-hash').textContent='Full run SHA-256: '+D.provenance.artifact_sha256;
-for(const id of ['route-from','route-to'])$(id).innerHTML=Array.from({length:16},(_,i)=>`<option value="${i}">C${i}</option>`).join('');
-$('route-from').value=5;$('route-to').value=9;
+for(const id of ['route-from','route-to'])$(id).innerHTML=Array.from({length:CHIPS},(_,i)=>`<option value="${i}">C${i}</option>`).join('');
+[$('route-from').value,$('route-to').value]=D.topology.host_chiplets;
 $('check-route').onclick=()=>{
   const a=+$('route-from').value,b=+$('route-to').value;state.route=route(a,b);renderTopology();
   $('route-result').textContent=a===b?'Same chiplet: no D2D transfer required.':state.route?`${state.route.map(c=>'C'+c).join(' → ')} · ${state.route.length-1} physical hop(s). ${state.route.length>2?'No direct physical link; route through intermediate chiplets.':'Direct physical link exists.'}`:'No legal physical route.';

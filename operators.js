@@ -16,6 +16,20 @@ const layerGroups = [
   ['output','Layer output',1,10]
 ].map(([id,label,col,row])=>({id,label,x:150+270*col,y:54+100*row}));
 
+// TP shares come from the exported run: contiguous ranges that differ by at most one.
+// With more ranks than KV heads (TP9 over eight heads) some ranks own no attention head.
+const tpRanks = () => CASCADE_DATA.stages[0].chips.length;
+const tpWord = () => ({4:'four',9:'nine'})[tpRanks()]||String(tpRanks());
+const shareCounts = kind => CASCADE_DATA.rank_shares.map(s=>s[kind]?s[kind][1]-s[kind][0]:0);
+const maxShare = kind => Math.max(...shareCounts(kind));
+function countText(kind,scale=1){
+  const counts=shareCounts(kind).filter(n=>n>0).map(n=>n*scale),low=Math.min(...counts),high=Math.max(...counts);
+  return low===high?String(high):`${low}–${high}`;
+}
+const idleRanks = () => shareCounts('kv_heads').filter(n=>n===0).length;
+const idleNote = () => idleRanks()?` ${idleRanks()} of ${tpRanks()} ranks own no KV head; they skip attention and only relay TP sums.`:'';
+const isTreeReduce = key => /^(attention_reduce|ffn_reduce)\.(up|tree_sum|down)$/.test(key);
+
 // Mark actual saved messages; local dispatch and local TP adds have no badge.
 function communicationLabel(op){
   const d2d=op.messages.filter(m=>m.kind==='d2d_send').length;
@@ -24,18 +38,18 @@ function communicationLabel(op){
 }
 
 function describeOperator(op, model, block, boundary){
-  const d=model.hidden_size, q=model.num_attention_heads/4, kv=model.num_key_value_heads/4;
-  const h=model.head_dim, s=model.intermediate_size/4, n=block.attention_tokens;
+  const d=model.hidden_size, g=model.num_attention_heads/model.num_key_value_heads, kv=maxShare('kv_heads'), q=kv*g;
+  const h=model.head_dim, s=maxShare('expert_columns'), n=block.attention_tokens, T=tpRanks(), ranks=tpWord();
   const item=(label,group,mode,equation,explanation)=>({label,group,mode,equation,explanation});
   const key=op.key;
   if(boundary){
     const entry=boundary==='input';
     if(key==='input.host')return item('Host activation input','input','host',`Host → C${op.messages[0].chiplet_id}: [1, ${d}]`,'The host supplies one activation vector. Embedding computation is outside this saved run.');
-    if(key==='input.broadcast'||key==='stage.broadcast')return item('TP input broadcast',entry?'input':'output','broadcast',`One [1, ${d}] vector → four identical TP inputs`,'The incoming chiplet forwards the activation along the physical tree. This happens once at a stage entry; layers within a stage retain the four local copies.');
-    if(key==='stage.relay')return item(entry?'Incoming PP relay':'Outgoing PP relay',entry?'input':'output','relay',`[1, ${d}] → next PP stage`,'Only the final layer of a PP stage relays its activation. The next stage broadcasts the received vector to its four TP ranks.');
-    if(key==='head.projection')return item('LM head projection','output','vocab',`[1, ${d}] × [${d}, ${model.vocab_size/4}] → one vocabulary shard`,'Each rank owns one quarter of the vocabulary columns. All ranks consume the same normalized final activation.');
-    if(key==='head.gather')return item('Gather vocabulary shards','output','gather','Four vocabulary shards → host-connected chiplet','Three remote shards travel to the host-connected chiplet; its own shard remains local. These transfers are gather operations, so their values are concatenated, not summed.');
-    if(key==='head.concatenate')return item('Concatenate logits','output','master',`4 × ${model.vocab_size/4} columns → ${model.vocab_size} logits`,'The host-connected chiplet concatenates the four vocabulary slices in TP rank order.');
+    if(key==='input.broadcast'||key==='stage.broadcast')return item('TP input broadcast',entry?'input':'output','broadcast',`One [1, ${d}] vector → ${T} identical TP inputs`,`The incoming chiplet forwards the activation along the physical tree. This happens once at a stage entry; layers within a stage retain the ${ranks} local copies.`);
+    if(key==='stage.relay')return item(entry?'Incoming PP relay':'Outgoing PP relay',entry?'input':'output','relay',`[1, ${d}] → next PP stage`,`Only the final layer of a PP stage relays its activation. The next stage broadcasts the received vector to its ${ranks} TP ranks.`);
+    if(key==='head.projection')return item('LM head projection','output','vocab',`[1, ${d}] × [${d}, ${countText('vocabulary')}] → one vocabulary shard`,`Each rank owns a contiguous 1/${T} share of the vocabulary columns. All ranks consume the same normalized final activation.`);
+    if(key==='head.gather')return item('Gather vocabulary shards','output','gather',`${T} vocabulary shards → host-connected chiplet`,`${T-1} remote shards travel to the host-connected chiplet; its own shard remains local. These transfers are gather operations, so their values are concatenated, not summed.`);
+    if(key==='head.concatenate')return item('Concatenate logits','output','master',`${T} shards × ${countText('vocabulary')} columns → ${model.vocab_size} logits`,`The host-connected chiplet concatenates the ${ranks} vocabulary slices in TP rank order.`);
     if(key==='head.host')return item('Host logits output','output','host',`${model.vocab_size} logits → host`,'The completed logits leave the host-connected chiplet. Sampling is outside this saved run.');
   }
   const norm=key.match(/^(norm[12]|head\.norm)\.(square|mean|scale|output)$/);
@@ -52,7 +66,7 @@ function describeOperator(op, model, block, boundary){
   }
   for(const name of ['Q','K','V']){
     const heads=name==='Q'?q:kv, width=heads*h, mode=name==='Q'?'q':'kv';
-    if(key===name+'.raw')return item(name+' projection',name.toLowerCase(),mode,`X[1, ${d}] × W${name}[${d}, ${width}] → ${heads} local heads`,'The full input is replicated. Weight columns and output heads are split across four chiplets; each chiplet computes complete local heads.');
+    if(key===name+'.raw')return item(name+' projection',name.toLowerCase(),mode,`X[1, ${d}] × W${name}[${d}, ${width}] → ${heads} local heads`,`The full input is replicated. Weight columns and output heads are split across ${ranks} chiplets; each chiplet computes complete local heads.${idleNote()}`);
     if(key===name)return item(name+' projection bias',name.toLowerCase(),mode,`${name} + B${name}[${width}]`,'Add the bias slice for these local heads. The head partition is unchanged.');
     if(key===name+'_ROPE')return item(name+' YaRN RoPE',name.toLowerCase()+'_rope',mode,`YaRN(${name}, absolute position ${CASCADE_DATA.config.context_tokens})`,'Rotate each complete local head at the decode position. No values from another TP rank are needed.');
   }
@@ -71,7 +85,7 @@ function describeOperator(op, model, block, boundary){
     const [label,group,equation,explanation]=attention[key];
     return item(label,group,'q',equation,explanation+' Heads remain local throughout attention; there is no attention-head exchange.');
   }
-  if(key==='OP_PARTIAL')return item('O projection partial','o','partial',`local context[1, ${q*h}] × WO[${q*h}, ${d}] → partial[1, ${d}]`,'O weight rows follow the query-head partition. Each chiplet produces a full-width partial result; the four partials must be summed.');
+  if(key==='OP_PARTIAL')return item('O projection partial','o','partial',`local context[1, ${q*h}] × WO[${q*h}, ${d}] → partial[1, ${d}]`,`O weight rows follow the query-head partition. Each chiplet produces a full-width partial result; the ${ranks} partials must be summed.${idleNote()}`);
   const reduction=key.match(/^(attention_reduce|ffn_reduce)\.r([01])\.(exchange|sum)$/);
   if(reduction){
     const [,group,round,action]=reduction, first=round==='0';
@@ -80,6 +94,16 @@ function describeOperator(op, model, block, boundary){
       (first?'The first round pairs horizontal neighbors. ':'The second round pairs vertical neighbors. ')+
       (action==='exchange'?'Each rank sends its current vector to its partner. Inspect one actual message and its read/link/write services at a time; the visual steps do not serialize the simulated exchanges.':first?'Each chiplet adds the received partial to its own. This is still only a two-rank sum.':'Each chiplet adds the received pair sum. All four chiplets now hold the same complete result.'));
   }
+  const tree=key.match(/^(attention_reduce|ffn_reduce)\.(up|tree_sum|down)$/);
+  if(tree){
+    const [,group,part]=tree,name=group==='attention_reduce'?'Attention':'MoE';
+    if(part==='up')return item(`${name} TP sum: send partials up`,group,'exchange',`${op.messages.length} directed messages × [1, ${d}]`,
+      `Each rank sends its current partial one step toward the stage's most central chiplet, along a shortest-path tree inside the ${Math.sqrt(T)} × ${Math.sqrt(T)} group; deeper ranks send first.${group==='attention_reduce'&&idleRanks()?' A rank without KV heads has no attention partial, so a head-less leaf sends nothing.':''} Inspect one actual message and its read/link/write services at a time.`);
+    if(part==='tree_sum')return item(`${name} TP sum: local add`,group,'tree_sum','own partial + each received child partial',
+      `A parent adds every received child partial to its own on SIMD. When the root has added its children, it holds the sum of all ${ranks} ranks.`);
+    return item(`${name} TP sum: broadcast total`,group,'broadcast',`${op.messages.length} directed messages × [1, ${d}]`,
+      `The root copies the complete sum back down the same tree, so all ${ranks} ranks hold equal complete results.`);
+  }
   if(key==='O_BIASED')return item('O output bias','o_bias','replicated',`complete O result + BO[${d}]`,'Add the O bias after the TP sum, once to each replicated complete result. Adding it separately to every partial before summing would multiply the bias.');
   if(key==='RES1')return item('Attention residual add','residual1','replicated','layer input + complete attention output','Both operands are full-width local replicas. The residual addition runs on SIMD and requires no D2D transfer.');
   if(key==='router_logits.raw')return item('Expert router projection','router','replicated',`normalized input[1, ${d}] × router[${d}, ${model.num_local_experts}]`,'The small router is replicated. Each rank evaluates the same complete expert logits; expert weights are still tensor-partitioned.');
@@ -87,15 +111,15 @@ function describeOperator(op, model, block, boundary){
   if(key==='routing_weights')return item('Select and normalize expert weights','router','replicated',`${model.num_experts_per_tok} selected experts of ${model.num_local_experts}`,'The command applies selected-expert softmax. Active expert IDs in this run come from deterministic synthetic assignments, not learned router decisions.');
   const experts={
     dispatch:['Expert dispatch','dispatch','replicated',`normalized input → active expert input[1, ${d}]`,'Every expert is TP-split across this same group. Dispatch is a local copy; this mapping has no expert-parallel all-to-all.'],
-    'up.raw':['Expert up projection','up','expert_width',`input[1, ${d}] × Wup[${d}, ${s}] → up[1, ${s}]`,'Each rank owns one quarter of each active expert’s intermediate columns.'],
+    'up.raw':['Expert up projection','up','expert_width',`input[1, ${d}] × Wup[${d}, ${s}] → up[1, ${s}]`,`Each rank owns a contiguous 1/${T} share of each active expert’s intermediate columns.`],
     up:['Expert up bias','up','expert_width',`up + Bup[${s}]`,'Add the matching intermediate-column bias slice.'],
     'gate.raw':['Expert gate projection','gate','expert_width',`input[1, ${d}] × Wgate[${d}, ${s}] → gate[1, ${s}]`,'Gate and up use the same intermediate-column partition.'],
     gate:['Expert gate bias','gate','expert_width',`gate + Bgate[${s}]`,'Add the gate bias for the local intermediate columns.'],
     glu:['Clipped SwiGLU','swiglu','expert_width',`clipped SwiGLU(gate, up) → [1, ${s}]`,'Clamp and combine matching local gate/up columns. All operands remain on the owning chiplet.'],
     down:['Expert down projection','down','partial',`local activation[1, ${s}] × Wdown[${s}, ${d}] → partial[1, ${d}]`,'Down weight rows follow the intermediate partition. Every chiplet produces a full-width partial expert result.'],
     down_biased:['Expert down bias','down_bias','rank_zero',`TP rank 0 partial + Bdown[${d}]`,'Only TP rank 0 adds this bias before the TP sum. This includes the bias exactly once in the final expert result.'],
-    weighted:['Apply routing weight','weight','partial','expert partial × token’s expert weight','Weight each active expert’s local partial before summing. The same routing weight is used by all four TP ranks.'],
-    accum:['Combine local expert partials','combine','partial',`Σ ${model.num_experts_per_tok} weighted expert partials`,'Add the active experts on each chiplet first. One TP all-reduce then sums the four combined partials; there is no separate all-reduce for every expert.']
+    weighted:['Apply routing weight','weight','partial','expert partial × token’s expert weight',`Weight each active expert’s local partial before summing. The same routing weight is used by all ${ranks} TP ranks.`],
+    accum:['Combine local expert partials','combine','partial',`Σ ${model.num_experts_per_tok} weighted expert partials`,`Add the active experts on each chiplet first. One TP all-reduce then sums the ${ranks} combined partials; there is no separate all-reduce for every expert.`]
   };
   if(key.startsWith('expert.')&&experts[key.slice(7)])return item(...experts[key.slice(7)]);
   if(key==='RES2')return item('MoE residual add','residual2','replicated','attention residual + complete MoE output','The complete TP-reduced MoE result is added to the residual on every rank. The next layer within this stage consumes these local copies.');
@@ -144,9 +168,9 @@ function operatorTensorGuide(op,sample,model,block,config){
     const partial=['OP_PARTIAL','expert.down'].includes(key);
     const steps=[`View the activation as ${m} row(s) of ${k} features. The local weight has ${k} input rows and ${n} output columns.`,
       `For each output column, sum ${k} activation × weight products. This produces ${m} × ${n} values.`];
-    if(key==='Q.raw')steps.push(`Store the ${n} features as ${model.num_attention_heads/4} complete query heads × ${model.head_dim} features. The two head axes group queries by their shared KV head; this reshape does not add computation.`);
-    if(['K.raw','V.raw'].includes(key))steps.push(`Store the ${n} features as ${model.num_key_value_heads/4} complete KV heads × ${model.head_dim} features.`);
-    if(partial)steps.push(`The ${n}-feature result covers the full hidden width but contains only this rank's contribution. A later TP sum adds all four ranks; this projection performs no D2D transfer.`);
+    if(key==='Q.raw')steps.push(`Store the ${n} features as ${n/model.head_dim} complete query heads × ${model.head_dim} features. The two head axes group queries by their shared KV head; this reshape does not add computation.`);
+    if(['K.raw','V.raw'].includes(key))steps.push(`Store the ${n} features as ${n/model.head_dim} complete KV heads × ${model.head_dim} features.`);
+    if(partial)steps.push(`The ${n}-feature result covers the full hidden width but contains only this rank's contribution. A later TP sum adds all ${tpWord()} ranks; this projection performs no D2D transfer.`);
     else if(key==='router_logits.raw')steps.push('Each rank computes the full set of expert scores; these columns are replicated across TP ranks.');
     else steps.push('This rank owns these output columns. The stored shape preserves the batch/token grouping.');
     return guide(partial?'Project a local feature shard into a full-width partial result.':'Multiply an activation by the local projection weight.',steps,
@@ -172,14 +196,20 @@ function operatorTensorGuide(op,sample,model,block,config){
     'The output shape names the visible cache after the update. This operation has no chiplet-to-chiplet transfer.'],
   ['New token heads'],['Visible local cache'],[kv],[['batch','local KV heads','visible cached positions','head features']],`${dims(inputs[0])} → update newest cache position → ${dims(outputs[0])}`);
   if(key==='flash_attention'){
-    const n=inputs[1].shape[2],f=model.head_dim,heads=inputs[0].shape[1]*inputs[0].shape[2];
-    return guide('For each query head, summarize its matching cached value vectors.',[
+    // Split-sequence groups (one token per microbatch) add FP32 partial states that SIMD merges.
+    const isPartial=t=>/\.partial\d+$/.test(t.tensor_id),partials=inputs.filter(isPartial);
+    const core=inputs.filter(t=>!isPartial(t)),finals=outputs.filter(t=>!isPartial(t));
+    const n=core[1].shape[2],f=model.head_dim,heads=core[0].shape[1]*core[0].shape[2];
+    const merge=partials.length?[`Here each KV group's ${n} positions are split over ${partials.length} PEs. Each PE writes an FP32 partial state per head (weighted value, denominator, running maximum); SIMD merges the ${partials.length} states and applies the sink once.`]:[];
+    const view=guide('For each query head, summarize its matching cached value vectors.',[
       `One query [1 × ${f}] compares with its KV group's keys [${n} × ${f}]. Dot products and division by √${f} give ${n} scores: [1 × ${n}].`,
       `Normalize those scores together with one learned sink logit. There are ${n} real-token weights plus one sink weight; the sink contributes no value vector.`,
       `Multiply the real-token weights [1 × ${n}] by values [${n} × ${f}] to get one context [1 × ${f}]. Repeat for the ${heads} local query heads; every ${inputs[0].shape[2]} query heads share one KV head.`,
-      `FlashAttention processes at most ${config.flash_attention_block_tokens} cached positions per block and retains running state in scratch. The [1 × ${n}] score/weight shapes explain the equivalent calculation; complete score/weight tensors are not stored in HBM.`],
+      `FlashAttention processes at most ${config.flash_attention_block_tokens} cached positions per block and retains running state in scratch. The [1 × ${n}] score/weight shapes explain the equivalent calculation; complete score/weight tensors are not stored in HBM.`,...merge],
     ['Query heads','Cached keys','Cached values','Learned sink logits'],['Context per query head'],[query,['batch','local KV heads','visible cached positions','head features'],['batch','local KV heads','visible cached positions','head features'],['batch','local KV groups','query heads per KV group','query tokens','one sink logit']],[query],
     `Per head: [1 × ${f}] × [${f} × ${n}] → scores [1 × ${n}] → weights × [${n} × ${f}] → context [1 × ${f}]`);
+    const axes=[query,['batch','local KV heads','visible cached positions','head features'],['batch','local KV heads','visible cached positions','head features'],['batch','local KV groups','query heads per KV group','query tokens','one sink logit']];
+    return {...view,inputs:rows(core,['Query heads','Cached keys','Cached values','Learned sink logits'],axes),outputs:rows(finals,['Context per query head'],[query])};
   }
   const attention={
     scores:['Compare each query with every visible key.',['Dot products reduce the head-feature axis and create one score per cached position.','Each query uses the KV head of its GQA group.'],['Query heads','Cached keys'],[query,kv],scores],
@@ -200,14 +230,20 @@ function operatorTensorGuide(op,sample,model,block,config){
   if(/^(attention_reduce|ffn_reduce)\.r[01]\.sum$/.test(key))return same('Add the received TP partial to the local partial.',[
     `Add corresponding features of the two ${last(outputs[0])}-feature vectors after the receive has completed. This step is local SIMD.`,
     key.includes('.r0.')?'The result includes two ranks. A second exchange and sum will combine all four ranks.':'Each output is now a complete four-rank result. The four chiplets retain equal-shaped replicas.'],['Local partial','Received partial']);
+  if(/^(attention_reduce|ffn_reduce)\.(up|down)$/.test(key))return same(key.endsWith('.up')?'Copy a TP partial one step toward the tree root.':'Copy the complete TP sum one step down the tree.',[
+    'Transfer the same-shaped vector along the saved physical route: source HBM read → D2D hop(s) → destination HBM write.',
+    key.endsWith('.up')?'Receiving preserves the feature values and shape. The parent adds it in the separate local sum operation.':'Every rank receives the same complete result; copying does not change any feature values.'],[key.endsWith('.up')?'Child TP partial':'Complete TP sum']);
+  if(/^(attention_reduce|ffn_reduce)\.tree_sum$/.test(key))return same('Add a received child partial to the parent’s partial.',[
+    `Add corresponding features of the two ${last(outputs[0])}-feature vectors after the receive has completed. This step is local SIMD.`,
+    `A parent repeats this for each child. After the root's last add, its vector is the sum of all ${tpWord()} ranks.`],['Parent partial','Received child partial']);
   if(key==='routing_weights')return guide('Normalize the fixed selected experts’ weights in a full expert-width vector.',[
     `The input has ${last(inputs[0])} expert scores per token. This saved performance run uses ${config.expert_routes?'provided':'synthetic balanced'} expert assignments, rather than computing a learned top-k decision.`,
     `Normalize only the ${model.num_experts_per_tok} selected expert scores. Store their weights in the matching expert columns and put zero in the other columns.`,
-    'The expert axis keeps its full width; this is not a compact four-column output.'],['All expert scores'],['Sparse routing weights'],[['batch','tokens','all experts']],[['batch','tokens','all experts']],`${dims(inputs[0])} → ${model.num_experts_per_tok} active entries per token → ${dims(outputs[0])}`);
+    `The expert axis keeps its full width; this is not a compact ${model.num_experts_per_tok}-column output.`],['All expert scores'],['Sparse routing weights'],[['batch','tokens','all experts']],[['batch','tokens','all experts']],`${dims(inputs[0])} → ${model.num_experts_per_tok} active entries per token → ${dims(outputs[0])}`);
   if(key==='expert.dispatch')return guide('Gather token rows assigned to this expert.',[
     'Use the saved expert assignments to choose token rows; keep each row’s full hidden-feature vector.',
     `This example groups ${outputs[0].shape[0]} assigned token row(s). With this batch-1 run, its stored tensor has shape ${dims(outputs[0])}.`,
-    'The copy stays inside the owning chiplet. Experts are TP-sharded across the same four ranks; this is not an EP all-to-all.'],
+    `The copy stays inside the owning chiplet. Experts are TP-sharded across the same ${tpWord()} ranks; this is not an EP all-to-all.`],
   ['Normalized activation','Routing weights'],['Expert token group'],[hidden,['batch','tokens','all experts']],[['assigned token rows','singleton token axis','hidden features']],`${dims(inputs[0])} → gather assigned rows → ${dims(outputs[0])}`);
   if(key==='expert.glu')return same('Combine matching gate and up features element by element.',[
     `Both branches have ${last(outputs[0])} local intermediate features. Cap gate only above at ${model.swiglu_limit}; clip up to [−${model.swiglu_limit}, ${model.swiglu_limit}].`,
@@ -220,7 +256,7 @@ function operatorTensorGuide(op,sample,model,block,config){
   ['Expert partial','Routing weights'],['Weighted partial in batch slots'],[['assigned token rows','singleton token axis','hidden features'],['batch','tokens','all experts']],[hidden],`${dims(inputs[0])} × one expert weight → ${dims(outputs[0])}`);
   if(key==='expert.accum')return same('Add the next weighted expert partial to the local running sum.',[
     `Add corresponding features of two ${last(outputs[0])}-feature vectors; the output width stays the same.`,
-    'Repeat for the remaining active experts on this rank. The later MoE TP sum combines all four ranks.'],['Previous expert sum / first contribution','Next expert contribution']);
+    `Repeat for the remaining active experts on this rank. The later MoE TP sum combines all ${tpWord()} ranks.`],['Previous expert sum / first contribution','Next expert contribution']);
   if(key==='RES1'||key==='RES2')return same('Add the completed block result to its residual activation.',[
     'Both inputs already have the full hidden width and are local to the same chiplet.',
     'Add corresponding features. This preserves the activation shape for the next block or layer.'],['Residual activation','Complete block result']);
@@ -231,9 +267,9 @@ function operatorTensorGuide(op,sample,model,block,config){
   const transfers={
     'input.host':['Copy the host activation into master-chiplet HBM.','Embedding computation is outside this saved run.'],
     'input.broadcast':['Copy the incoming activation to the TP ranks.','Each destination gets the same full hidden-width activation; copying does not split or add its features.'],
-    'stage.broadcast':['Copy the received PP activation to the new stage’s TP ranks.','The four ranks receive full hidden-width replicas before executing their local shards.'],
-    'stage.relay':['Copy the completed layer activation to the next PP stage.','The next stage broadcasts this vector to its four TP ranks.'],
-    'head.gather':['Copy one vocabulary shard to the master chiplet.','Keep its vocabulary columns intact. A later concatenate operation joins the four disjoint shards.'],
+    'stage.broadcast':['Copy the received PP activation to the new stage’s TP ranks.',`The ${tpWord()} ranks receive full hidden-width replicas before executing their local shards.`],
+    'stage.relay':['Copy the completed layer activation to the next PP stage.',`The next stage broadcasts this vector to its ${tpWord()} TP ranks.`],
+    'head.gather':['Copy one vocabulary shard to the master chiplet.',`Keep its vocabulary columns intact. A later concatenate operation joins the ${tpWord()} disjoint shards.`],
     'head.host':['Copy the complete vocabulary logits to the host.','Host sampling is outside this trace.']
   };
   if(transfers[key]){
@@ -287,7 +323,10 @@ function operatorFormula(op,model,block,config){
     'next_context_sum = a × context_sum + sum of p[t] × value[t] in block',
     'Replace m, denom and context_sum with their next values; final context = context_sum / denom'
   ],attentionSymbols+` The first three lines express the result; the implementation uses the stable block algorithm below them. Process at most ${config.flash_attention_block_tokens} KV tokens per block, including the final tail. m is the running maximum, denom the running denominator, and context_sum a ${h}-feature weighted sum. They persist in scratch; the sink is initialized exactly once. No full HBM score/probability tensors are created.`);
-  if(key==='OP_PARTIAL')return result(['partial = local_context × local_WO'],'local_context holds the local query heads; local_WO owns matching input rows. partial has the full hidden width. A separate TP reduction adds the four partials.');
+  if(key==='OP_PARTIAL')return result(['partial = local_context × local_WO'],`local_context holds the local query heads; local_WO owns matching input rows. partial has the full hidden width. A separate TP reduction adds the ${tpWord()} partials.`);
+  const tree=key.match(/^(attention_reduce|ffn_reduce)\.(up|tree_sum|down)$/);
+  if(tree)return result(tree[2]==='up'?['parent_buffer ← child_partial']:tree[2]==='tree_sum'?['partial_parent ← partial_parent + received_child_partial']:['X_r ← root_sum  for every rank r'],
+    `The tree is rooted at the group's most central chiplet. Each parent adds its children's partials (up), so the root holds Σ over all ${tpRanks()} ranks; the root then broadcasts that sum down the same tree. Sends are physical SEND/receive; additions are local SIMD.`);
   const reduction=key.match(/^(attention_reduce|ffn_reduce)\.r([01])\.(exchange|sum)$/);
   if(reduction){
     const round=+reduction[2]+1;
@@ -304,7 +343,7 @@ function operatorFormula(op,model,block,config){
   ],`selected contains ${model.num_experts_per_tok} expert IDs. This performance run uses ${config.expert_routes?'provided':'synthetic balanced'} assignments; it does not predict learned TopK. Softmax normalizes only the selected logits.`);
   const expert={
     dispatch:[['expert_input = gather(normalized_input, assigned_token_rows)'],'Gather copies token rows assigned to this expert, locally on each TP rank.'],
-    'up.raw':[['up_raw = expert_input × local_up_weight'],'Each TP rank owns a quarter of the intermediate output columns.'],
+    'up.raw':[['up_raw = expert_input × local_up_weight'],`Each TP rank owns a contiguous 1/${tpRanks()} share of the intermediate output columns.`],
     up:[['up = up_raw + local_up_bias'],'Bias follows the same intermediate-column slice.'],
     'gate.raw':[['gate_raw = expert_input × local_gate_weight'],'Gate and up own matching intermediate columns.'],
     gate:[['gate = gate_raw + local_gate_bias'],'Bias follows the same intermediate-column slice.'],
@@ -313,18 +352,18 @@ function operatorFormula(op,model,block,config){
     down:[['partial = local_intermediate × local_down_weight'],'The weight owns the matching intermediate input rows. Each result is a full hidden-width partial.'],
     down_biased:[['biased_partial = partial + expert_down_bias (only on TP rank 0)'],'Other ranks retain their unbiased partial. The TP sum includes the down bias exactly once.'],
     weighted:[['weighted_partial = expert_partial × routing_weight_for_this_expert','batch_result = scatter(weighted_partial, original_token_rows)'],'The routing weight is one scalar per assigned token, shared by its features and TP ranks. Unassigned batch slots are zero.'],
-    accum:[['next_sum = previous_sum + next_weighted_expert_partial'],'Repeat for the active experts on this rank. The separate MoE TP reduction adds all four rank sums.']
+    accum:[['next_sum = previous_sum + next_weighted_expert_partial'],`Repeat for the active experts on this rank. The separate MoE TP reduction adds all ${tpWord()} rank sums.`]
   };
   if(key.startsWith('expert.')&&expert[key.slice(7)])return result(...expert[key.slice(7)]);
   if(key==='RES2')return result(['Xout = Xattn + M'],'M is the complete TP-reduced weighted MoE result. Xout feeds the next layer or PP relay.');
   const boundary={
     'input.host':[['Xmaster ← Xhost'],'The host provides the activation; embedding computation is outside the trace.'],
-    'input.broadcast':[['Xr ← Xentry  for r = 0,1,2,3'],'Broadcast makes identical TP input copies along the recorded physical routes.'],
-    'stage.broadcast':[['Xr ← Xentry  for r = 0,1,2,3'],'The next stage broadcasts its received PP activation.'],
+    'input.broadcast':[[`Xr ← Xentry  for r = 0…${tpRanks()-1}`],'Broadcast makes identical TP input copies along the recorded physical routes.'],
+    'stage.broadcast':[[`Xr ← Xentry  for r = 0…${tpRanks()-1}`],'The next stage broadcasts its received PP activation.'],
     'stage.relay':[['Xstage+1,entry ← Xstage,last'],'Relay copies the completed activation to the next PP stage.'],
     'head.projection':[['logitsr = Xfinal_norm WLM,r'],'Each rank owns one vocabulary-column shard; this is not a partial sum.'],
     'head.gather':[['master_buffer[r] ← logitsr'],'Gather preserves each vocabulary shard; it does not add shard values.'],
-    'head.concatenate':[['logits = concat(logits0, logits1, logits2, logits3)'],'Concatenate vocabulary columns in TP rank order.'],
+    'head.concatenate':[[`logits = concat(logits0, …, logits${tpRanks()-1})`],'Concatenate vocabulary columns in TP rank order.'],
     'head.host':[['logitshost ← logitsmaster'],'Return the complete logits; host sampling is outside the trace.']
   };
   if(boundary[key])return result(...boundary[key]);
@@ -332,29 +371,33 @@ function operatorFormula(op,model,block,config){
 }
 
 function rankLayout(description, rank, model){
-  const q=model.num_attention_heads/4, kv=model.num_key_value_heads/4, s=model.intermediate_size/4;
-  if(description.mode==='q')return `Q heads ${rank*q}–${(rank+1)*q-1}`;
-  if(description.mode==='kv')return `KV heads ${rank*kv}–${(rank+1)*kv-1}`;
-  if(description.mode==='expert_width')return `Expert columns ${rank*s}–${(rank+1)*s-1}`;
-  if(description.mode==='vocab')return `Vocabulary ${rank*model.vocab_size/4}–${(rank+1)*model.vocab_size/4-1}`;
+  const share=CASCADE_DATA.rank_shares[rank],g=model.num_attention_heads/model.num_key_value_heads;
+  const span=(name,range,scale=1)=>range[1]-range[0]===1&&scale===1?`${name} ${range[0]}`:`${name}s ${range[0]*scale}–${range[1]*scale-1}`;
+  const noHeads='No KV head · relays TP sums';
+  if(description.mode==='q')return share.kv_heads?span('Q head',share.kv_heads,g):noHeads;
+  if(description.mode==='kv')return share.kv_heads?span('KV head',share.kv_heads):noHeads;
+  if(description.mode==='expert_width')return `Expert columns ${share.expert_columns[0]}–${share.expert_columns[1]-1}`;
+  if(description.mode==='vocab')return `Vocabulary ${share.vocabulary[0]}–${share.vocabulary[1]-1}`;
   if(description.mode==='partial')return `${model.hidden_size}-feature partial sum`;
   if(description.mode==='pair_sum')return 'Sum of two TP ranks';
+  if(description.mode==='tree_sum')return 'Adds received child partials';
   if(description.mode==='rank_zero')return rank===0?'Down bias added once':'No down-bias command';
   return 'Replicated input / local output';
 }
 
 function tensorPartitionSummary(op, model, block){
   const d=model.hidden_size,q=model.num_attention_heads,h=model.head_dim,kv=model.num_key_value_heads,s=model.intermediate_size;
+  const T=tpRanks(),g=q/kv,idle=idleRanks()?` ${idleRanks()} ranks own none.`:'';
   if(['Q.raw','Q','Q_ROPE','K.raw','K','K_ROPE','V.raw','V'].includes(op.key)){
-    const heads=op.key.startsWith('Q')?q:kv;
-    return `${heads} global heads × ${h} features → 4 ranks × ${heads/4} complete heads. Projection weights split ${heads*h} output columns into ${heads*h/4} columns per rank.`;
+    const heads=op.key.startsWith('Q')?q:kv,scale=op.key.startsWith('Q')?g:1;
+    return `${heads} global heads × ${h} features → ${T} ranks; an owning rank holds ${countText('kv_heads',scale)} complete heads (${countText('kv_heads',scale*h)} projection columns).${idle}`;
   }
-  if(op.key==='K_CACHE'||op.key==='V_CACHE')return `Global cache [1 × ${kv} × ${block.attention_tokens} × ${h}] → 4 local caches [1 × ${kv/4} × ${block.attention_tokens} × ${h}]. The new token is appended only to the owning head slice.`;
-  if(op.key==='OP_PARTIAL')return `Global WO [${q*h} × ${d}] → 4 row shards [${q*h/4} × ${d}]. Each rank produces ${d} output features as a partial sum; TP reduction combines the four partials.`;
-  if(['expert.up.raw','expert.up','expert.gate.raw','expert.gate','expert.glu'].includes(op.key))return `Each expert has ${s} intermediate features → 4 ranks × ${s/4} features. Up and gate weights split their output columns; SwiGLU keeps the same partition.`;
-  if(op.key==='expert.down')return `Each expert’s Wdown [${s} × ${d}] → 4 row shards [${s/4} × ${d}]. Outputs are full-width partial sums, rather than disjoint output feature slices.`;
-  if(op.key==='head.projection')return `Global LM weights [${d} × ${model.vocab_size}] → 4 column shards [${d} × ${model.vocab_size/4}]. Vocabulary outputs are concatenated, not reduced.`;
-  if(['scores','scaled','maximum','exp','denominator','av_raw','av','flash_attention'].includes(op.key))return `${q} query heads and ${kv} KV heads → ${q/4} Q + ${kv/4} KV heads per rank. Complete heads stay local across score calculation, softmax and value aggregation.`;
-  if(op.key.startsWith('router_')||op.key==='routing_weights')return `The full router [${d} × ${model.num_local_experts}] is replicated across TP ranks. Every active expert then uses the same four-rank intermediate partition.`;
+  if(op.key==='K_CACHE'||op.key==='V_CACHE')return `Global cache [1 × ${kv} × ${block.attention_tokens} × ${h}] → local caches of ${countText('kv_heads')} KV head(s) [1 × ${countText('kv_heads')} × ${block.attention_tokens} × ${h}].${idle} The new token is appended only to the owning head slice.`;
+  if(op.key==='OP_PARTIAL')return `Global WO [${q*h} × ${d}] → row shards of ${countText('kv_heads',g*h)} rows on the owning ranks.${idle} Each owner produces ${d} output features as a partial sum; TP reduction combines them.`;
+  if(['expert.up.raw','expert.up','expert.gate.raw','expert.gate','expert.glu'].includes(op.key))return `Each expert has ${s} intermediate features → ${T} ranks × ${countText('expert_columns')} features. Up and gate weights split their output columns; SwiGLU keeps the same partition.`;
+  if(op.key==='expert.down')return `Each expert’s Wdown [${s} × ${d}] → ${T} row shards [${countText('expert_columns')} × ${d}]. Outputs are full-width partial sums, rather than disjoint output feature slices.`;
+  if(op.key==='head.projection')return `Global LM weights [${d} × ${model.vocab_size}] → ${T} column shards [${d} × ${countText('vocabulary')}]. Vocabulary outputs are concatenated, not reduced.`;
+  if(['scores','scaled','maximum','exp','denominator','av_raw','av','flash_attention'].includes(op.key))return `${q} query heads and ${kv} KV heads → ${countText('kv_heads',g)} Q + ${countText('kv_heads')} KV heads per owning rank.${idle} Complete heads stay local across score calculation, softmax and value aggregation.`;
+  if(op.key.startsWith('router_')||op.key==='routing_weights')return `The full router [${d} × ${model.num_local_experts}] is replicated across TP ranks. Every active expert then uses the same ${T}-rank intermediate partition.`;
   return '';
 }
